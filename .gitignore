@@ -1,0 +1,14 @@
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/build
+/app/build
+/captures
+.externalNativeBuild
+.cxx
+*.apk
+!bzgk-app-release.apk
+!bzgk-app-debug.apk
+/app/bzgk.keystore
