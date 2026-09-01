@@ -12,6 +12,7 @@ import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
+import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
@@ -21,17 +22,20 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.animation.LinearInterpolator;
+import android.webkit.CookieManager;
 import android.webkit.RenderProcessGoneDetail;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
+import android.webkit.WebStorage;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import java.io.IOException;
 import java.net.HttpURLConnection;
@@ -45,6 +49,7 @@ public class MainActivity extends android.app.Activity {
     private static final long LOAD_TIMEOUT_MS = 18000;          // 单次加载超时
     private static final int  MAX_RETRY = 2;                    // 自动重试次数
     private static final int  PRECONNECT_TIMEOUT_MS = 4000;     // 预连超时
+    private static final long CLEANUP_INTERVAL_MS = 20 * 60 * 1000L; // 20分钟定期清理
 
     private WebView webView;
     private ScrollBarView scrollBar;
@@ -55,15 +60,21 @@ public class MainActivity extends android.app.Activity {
     private View errorOverlay;
     private TextView errorText;
     private TextView retryBtn;
+    private TextView netInfoView;                              // 网络信息(类型+速度)
+    private TextView cleanHintView;                            // 清理提示
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final Handler cleanupHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService io = Executors.newSingleThreadExecutor();
     private final Runnable timeoutRunnable = this::onLoadTimeout;
+    private final Runnable periodicCleanupRunnable = this::doPeriodicCleanup;
     private ConnectivityManager.NetworkCallback networkCallback;
     private boolean pageLoaded = false;
     private int retryCount = 0;
     private boolean receiverRegistered = false;
     private BroadcastReceiver connectivityReceiver;
+    private int lastNetSpeedKbps = -1;
+    private String lastNetType = "";
 
     @Override
     protected void onCreate(android.os.Bundle savedInstanceState) {
@@ -105,6 +116,39 @@ public class MainActivity extends android.app.Activity {
         barParams.gravity = Gravity.RIGHT;
         barParams.rightMargin = dp(2);
         root.addView(scrollBar, barParams);
+        // 长按滚动条:手动清理 WebView 缓存
+        scrollBar.setOnLongClickListener(v -> {
+            showCleanHint("正在清理缓存…");
+            mainHandler.postDelayed(() -> {
+                clearWebViewData();
+                showCleanHint("缓存已清理");
+                mainHandler.postDelayed(() -> cleanHintView.setVisibility(View.GONE), 1200);
+                // 清理后如果当前页未加载成功,重新拉取
+                if (!pageLoaded) {
+                    preconnectAndLoad();
+                } else {
+                    webView.reload();
+                }
+            }, 50);
+            return true;
+        });
+
+        // 顶部网络信息(类型 + 速度)
+        netInfoView = buildNetInfoView();
+        FrameLayout.LayoutParams infoParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        infoParams.gravity = Gravity.TOP | Gravity.START;
+        infoParams.leftMargin = dp(8);
+        infoParams.topMargin = dp(6);
+        root.addView(netInfoView, infoParams);
+
+        // 中央清理提示(默认隐藏)
+        cleanHintView = buildCleanHintView();
+        FrameLayout.LayoutParams hintParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        hintParams.gravity = Gravity.CENTER;
+        root.addView(cleanHintView, hintParams);
+        cleanHintView.setVisibility(View.GONE);
 
         setContentView(root);
 
@@ -113,9 +157,13 @@ public class MainActivity extends android.app.Activity {
 
         if (isNetworkAvailable()) {
             preconnectAndLoad();
+            startNetSpeedMonitor();
         } else {
             showError("当前无网络,请检查连接后重试");
         }
+
+        // 启动 WebView 定期清理(20 分钟)
+        schedulePeriodicCleanup();
     }
 
     private WebView buildWebView() {
@@ -305,6 +353,275 @@ public class MainActivity extends android.app.Activity {
 
     private void hideError() {
         errorOverlay.setVisibility(View.GONE);
+    }
+
+    // ============== 网络信息显示 ==============
+
+    private TextView buildNetInfoView() {
+        TextView tv = new TextView(this);
+        tv.setTextColor(Color.argb(200, 255, 255, 255));
+        tv.setTextSize(10);
+        tv.setPadding(dp(8), dp(2), dp(8), dp(2));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(Color.argb(140, 0, 0, 0));
+        bg.setCornerRadius(dp(10));
+        tv.setBackground(bg);
+        tv.setText(getNetInfoText());
+        return tv;
+    }
+
+    private String getNetInfoText() {
+        String type = getCurrentNetworkTypeName();
+        if (lastNetSpeedKbps < 0) {
+            return type;
+        }
+        if (lastNetSpeedKbps >= 1024) {
+            return type + "  " + (lastNetSpeedKbps / 1024) + "MB/s";
+        }
+        return type + "  " + lastNetSpeedKbps + "KB/s";
+    }
+
+    private String getCurrentNetworkTypeName() {
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null) return "离线";
+            Network net = cm.getActiveNetwork();
+            if (net == null) return "离线";
+            NetworkCapabilities caps = cm.getNetworkCapabilities(net);
+            if (caps == null) return "离线";
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                return "WiFi";
+            } else if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI_AWARE)) {
+                        return "WiFi Aware";
+                    }
+                }
+                return "移动网络";
+            } else if (caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) {
+                return "有线";
+            } else {
+                return "在线";
+            }
+        } catch (Exception e) {
+            return "在线";
+        }
+    }
+
+    private void startNetSpeedMonitor() {
+        mainHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                testNetSpeed();
+                mainHandler.postDelayed(this, 30 * 1000); // 30秒测一次
+            }
+        }, 5 * 1000);
+    }
+
+    /**
+     * 异步测速:下载一个 50KB 静态资源,根据耗时估算当前带宽(KB/s)。
+     * 用于在网速过慢时给出"慢速"提示。
+     */
+    private void testNetSpeed() {
+        io.execute(() -> {
+            long start = System.currentTimeMillis();
+            int bytes = 0;
+            try {
+                HttpURLConnection conn = (HttpURLConnection) new URL(HOME_URL).openConnection();
+                conn.setConnectTimeout(3000);
+                conn.setReadTimeout(3000);
+                conn.setRequestMethod("HEAD");
+                conn.setUseCaches(false);
+                conn.connect();
+                int code = conn.getResponseCode();
+                conn.disconnect();
+                if (code >= 200 && code < 400) {
+                    // 头请求成功,真正下载小资源
+                    HttpURLConnection get = (HttpURLConnection) new URL(
+                            "https://openstd.samr.gov.cn/bzgk/std/favicon.ico").openConnection();
+                    get.setConnectTimeout(3000);
+                    get.setReadTimeout(3000);
+                    get.setUseCaches(false);
+                    java.io.InputStream is = get.getInputStream();
+                    byte[] buf = new byte[4096];
+                    int n;
+                    int total = 0;
+                    int maxRead = 50 * 1024; // 最多读 50KB
+                    start = System.currentTimeMillis();
+                    while ((n = is.read(buf)) > 0 && total < maxRead) {
+                        total += n;
+                    }
+                    bytes = total;
+                    is.close();
+                    get.disconnect();
+                }
+            } catch (Exception ignored) {}
+            long cost = System.currentTimeMillis() - start;
+            int kbps = 0;
+            if (cost > 0 && bytes > 0) {
+                kbps = (int) (bytes * 1000L / cost / 1024L);
+            }
+            int finalKbps = kbps;
+            mainHandler.post(() -> {
+                lastNetSpeedKbps = finalKbps;
+                String type = getCurrentNetworkTypeName();
+                if (!type.equals(lastNetType)) {
+                    lastNetType = type;
+                }
+                if (netInfoView != null) {
+                    netInfoView.setText(getNetInfoText());
+                    // 网速过慢(<10KB/s)时,把网络信息标红
+                    if (finalKbps > 0 && finalKbps < 10) {
+                        netInfoView.setTextColor(Color.parseColor("#FF6B6B"));
+                    } else {
+                        netInfoView.setTextColor(Color.argb(200, 255, 255, 255));
+                    }
+                }
+            });
+        });
+    }
+
+    // ============== WebView 数据清理 ==============
+
+    private TextView buildCleanHintView() {
+        TextView tv = new TextView(this);
+        tv.setTextColor(Color.WHITE);
+        tv.setTextSize(16);
+        tv.setPadding(dp(24), dp(14), dp(24), dp(14));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(Color.argb(220, 0, 0, 0));
+        bg.setCornerRadius(dp(12));
+        tv.setBackground(bg);
+        return tv;
+    }
+
+    private void showCleanHint(String msg) {
+        if (cleanHintView == null) return;
+        cleanHintView.setText(msg);
+        cleanHintView.setVisibility(View.VISIBLE);
+    }
+
+    /**
+     * 清理 WebView 累积的缓存/历史/表单/cookie/本地存储,
+     * 这是"用久了变卡"的主要成因——长期使用后,WebView 内部 DOM 缓存、
+     * localStorage、IndexedDB、HTTP 缓存会持续膨胀,占用大量内存和 CPU。
+     */
+    private void clearWebViewData() {
+        if (webView == null) return;
+        try {
+            webView.stopLoading();
+        } catch (Exception ignored) {}
+        try {
+            // 1. HTTP 缓存(含内存+磁盘)
+            webView.clearCache(true);
+        } catch (Exception ignored) {}
+        try {
+            // 2. 浏览历史
+            webView.clearHistory();
+        } catch (Exception ignored) {}
+        try {
+            // 3. 表单自动填充数据
+            webView.clearFormData();
+        } catch (Exception ignored) {}
+        try {
+            // 4. 内存中保存的密码等 SSL 偏好
+            webView.clearMatches();
+        } catch (Exception ignored) {}
+        try {
+            // 5. 全部 Cookie
+            CookieManager cm = CookieManager.getInstance();
+            cm.removeSessionCookies(null);
+            cm.removeAllCookies(null);
+            cm.removeExpiredCookie();
+            cm.flush();
+        } catch (Exception ignored) {}
+        try {
+            // 6. localStorage / IndexedDB / WebSQL / Application Cache
+            WebStorage.getInstance().deleteAllData();
+        } catch (Exception ignored) {}
+        try {
+            // 7. WebView 自身占用的图形缓存
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.HONEYCOMB) {
+                webView.freeMemory();
+            }
+        } catch (Exception ignored) {}
+        // 8. 提示 GC 回收
+        System.gc();
+    }
+
+    private void schedulePeriodicCleanup() {
+        cleanupHandler.removeCallbacks(periodicCleanupRunnable);
+        cleanupHandler.postDelayed(periodicCleanupRunnable, CLEANUP_INTERVAL_MS);
+    }
+
+    private void doPeriodicCleanup() {
+        try {
+            if (webView == null) return;
+            // 页面可见时才执行完整清理,避免影响当前浏览
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+                webView.onPause();
+            }
+            clearWebViewData();
+            // 重新激活
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+                webView.onResume();
+            }
+            // 重新拉取当前页(保留浏览历史的位置,reload 即可)
+            mainHandler.post(() -> {
+                if (webView != null && pageLoaded) {
+                    webView.reload();
+                }
+            });
+        } catch (Exception ignored) {}
+        // 下一轮
+        cleanupHandler.postDelayed(periodicCleanupRunnable, CLEANUP_INTERVAL_MS);
+    }
+
+    /**
+     * 系统级内存压力回调。系统会在低内存时调用此函数。
+     * 我们借此机会主动清理 WebView 缓存,避免 OOM 或被系统强杀。
+     */
+    @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        if (webView == null) return;
+        if (level >= TRIM_MEMORY_RUNNING_MODERATE) {
+            // 中等压力:释放非关键缓存
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.HONEYCOMB) {
+                    webView.freeMemory();
+                }
+            } catch (Exception ignored) {}
+        }
+        if (level >= TRIM_MEMORY_RUNNING_LOW || level == TRIM_MEMORY_COMPLETE) {
+            // 高压力或系统即将回收:深度清理
+            try {
+                webView.clearCache(true);
+            } catch (Exception ignored) {}
+            try {
+                WebStorage.getInstance().deleteAllData();
+            } catch (Exception ignored) {}
+            try {
+                CookieManager.getInstance().flush();
+            } catch (Exception ignored) {}
+        }
+        if (level >= TRIM_MEMORY_UI_HIDDEN) {
+            // 页面进入后台,主动暂停
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+                    webView.onPause();
+                }
+            } catch (Exception ignored) {}
+        }
+    }
+
+    @Override
+    public void onLowMemory() {
+        super.onLowMemory();
+        // 旧版系统回调:一次性深度清理
+        try {
+            if (webView != null) clearWebViewData();
+        } catch (Exception ignored) {}
     }
 
     // ============== WebView 客户端 ==============
@@ -521,6 +838,7 @@ public class MainActivity extends android.app.Activity {
     @Override
     protected void onDestroy() {
         cancelLoadTimeout();
+        cleanupHandler.removeCallbacks(periodicCleanupRunnable);
         try {
             if (networkCallback != null) {
                 ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
