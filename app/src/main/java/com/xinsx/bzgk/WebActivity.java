@@ -41,6 +41,7 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 
 /**
  * 二级页面:「细分」。
@@ -91,6 +92,14 @@ public class WebActivity extends android.app.Activity {
     private int lastNetSpeedKbps = -1;
     private String lastNetType = "";
     private OnBackInvokedCallback backCallback;
+
+    /**
+     * Activity 是否已销毁。
+     * 页面切换时,后台线程/Handler 里排队的回调可能在本 Activity 销毁后才执行,
+     * 此时 webView 已被置空,继续调用会抛 NullPointerException 导致闪退。
+     * 所有异步回调在动手前都要先检查这个标志。
+     */
+    private volatile boolean destroyed = false;
 
     @Override
     protected void onCreate(android.os.Bundle savedInstanceState) {
@@ -144,15 +153,21 @@ public class WebActivity extends android.app.Activity {
         root.addView(scrollBar, barParams);
         // 长按滚动条:手动清理 WebView 缓存
         scrollBar.setOnLongClickListener(v -> {
+            if (destroyed) return true;
             showCleanHint("正在清理缓存…");
             mainHandler.postDelayed(() -> {
+                if (destroyed) return;
                 clearWebViewData();
                 showCleanHint("缓存已清理");
-                mainHandler.postDelayed(() -> cleanHintView.setVisibility(View.GONE), 1200);
+                mainHandler.postDelayed(() -> {
+                    if (!destroyed && cleanHintView != null) {
+                        cleanHintView.setVisibility(View.GONE);
+                    }
+                }, 1200);
                 // 清理后如果当前页未加载成功,重新拉取
                 if (!pageLoaded) {
                     preconnectAndLoad();
-                } else {
+                } else if (webView != null) {
                     webView.reload();
                 }
             }, 50);
@@ -304,44 +319,43 @@ public class WebActivity extends android.app.Activity {
      * 命中 CDN 节点后能显著缩短后续 HTTPS 的 TLS 握手耗时。
      */
     private void preconnectAndLoad() {
+        if (destroyed || webView == null) return;
         showLoading();
         startLoadTimeout();
-        io.execute(() -> {
-            try {
-                HttpURLConnection conn = (HttpURLConnection) new URL(homeUrl).openConnection();
-                conn.setConnectTimeout(PRECONNECT_TIMEOUT_MS);
-                conn.setReadTimeout(PRECONNECT_TIMEOUT_MS);
-                conn.setRequestMethod("HEAD");
-                conn.setInstanceFollowRedirects(true);
-                conn.setUseCaches(false);
-                conn.connect();
-                int code = conn.getResponseCode();
-                conn.disconnect();
-                mainHandler.post(() -> {
-                    if (code >= 200 && code < 400) {
-                        doLoadUrl(homeUrl);
-                    } else {
-                        doLoadUrl(homeUrl); // 仍尝试加载,失败时由 WebViewClient 处理
-                    }
-                });
-            } catch (IOException e) {
-                // 预连失败,直接尝试加载,由 WebView 自行处理
+        try {
+            io.execute(() -> {
+                try {
+                    HttpURLConnection conn = (HttpURLConnection) new URL(homeUrl).openConnection();
+                    conn.setConnectTimeout(PRECONNECT_TIMEOUT_MS);
+                    conn.setReadTimeout(PRECONNECT_TIMEOUT_MS);
+                    conn.setRequestMethod("HEAD");
+                    conn.setInstanceFollowRedirects(true);
+                    conn.setUseCaches(false);
+                    conn.connect();
+                    conn.getResponseCode();
+                    conn.disconnect();
+                } catch (IOException e) {
+                    // 预连失败,直接尝试加载,由 WebView 自行处理
+                } catch (Exception e) {
+                    // 忽略其它异常,统一走下面的加载分支
+                }
                 mainHandler.post(() -> doLoadUrl(homeUrl));
-            }
-        });
-    }
-
-    private void doLoadUrl(String url) {
-        pageLoaded = false;
-        retryCount++;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            webView.loadUrl(url);
-        } else {
-            webView.loadUrl(url);
+            });
+        } catch (RejectedExecutionException e) {
+            // 线程池已关闭(Activity 已销毁),无需再加载
         }
     }
 
+    private void doLoadUrl(String url) {
+        // Activity 销毁后 webView 已置空,这里必须挡住,否则会崩
+        if (destroyed || webView == null) return;
+        pageLoaded = false;
+        retryCount++;
+        webView.loadUrl(url);
+    }
+
     private void onLoadTimeout() {
+        if (destroyed || webView == null) return;
         if (pageLoaded) return;
         if (retryCount < MAX_RETRY) {
             // 自动重试一次
@@ -363,6 +377,7 @@ public class WebActivity extends android.app.Activity {
     }
 
     private void showLoading() {
+        if (destroyed) return;
         loadingOverlay.setVisibility(View.VISIBLE);
         errorOverlay.setVisibility(View.GONE);
         topProgress.setVisibility(View.VISIBLE);
@@ -370,11 +385,13 @@ public class WebActivity extends android.app.Activity {
     }
 
     private void hideLoading() {
+        if (destroyed) return;
         loadingOverlay.setVisibility(View.GONE);
         topProgress.setVisibility(View.GONE);
     }
 
     private void showError(String msg) {
+        if (destroyed) return;
         errorText.setText(msg);
         errorOverlay.setVisibility(View.VISIBLE);
         loadingOverlay.setVisibility(View.GONE);
@@ -382,6 +399,7 @@ public class WebActivity extends android.app.Activity {
     }
 
     private void hideError() {
+        if (destroyed) return;
         errorOverlay.setVisibility(View.GONE);
     }
 
@@ -442,8 +460,12 @@ public class WebActivity extends android.app.Activity {
         mainHandler.postDelayed(new Runnable() {
             @Override
             public void run() {
+                if (destroyed) return;
                 testNetSpeed();
-                mainHandler.postDelayed(this, 30 * 1000); // 30秒测一次
+                // 30秒测一次;Activity 销毁后不再续期
+                if (!destroyed) {
+                    mainHandler.postDelayed(this, 30 * 1000);
+                }
             }
         }, 5 * 1000);
     }
@@ -453,7 +475,9 @@ public class WebActivity extends android.app.Activity {
      * 用于在网速过慢时给出"慢速"提示。
      */
     private void testNetSpeed() {
-        io.execute(() -> {
+        if (destroyed) return;
+        try {
+            io.execute(() -> {
             long start = System.currentTimeMillis();
             int bytes = 0;
             try {
@@ -493,6 +517,7 @@ public class WebActivity extends android.app.Activity {
             }
             int finalKbps = kbps;
             mainHandler.post(() -> {
+                if (destroyed) return;
                 lastNetSpeedKbps = finalKbps;
                 String type = getCurrentNetworkTypeName();
                 if (!type.equals(lastNetType)) {
@@ -508,7 +533,10 @@ public class WebActivity extends android.app.Activity {
                     }
                 }
             });
-        });
+            });
+        } catch (RejectedExecutionException e) {
+            // 线程池已关闭(Activity 已销毁)
+        }
     }
 
     // ============== WebView 数据清理 ==============
@@ -537,7 +565,7 @@ public class WebActivity extends android.app.Activity {
      * localStorage、IndexedDB、HTTP 缓存会持续膨胀,占用大量内存和 CPU。
      */
     private void clearWebViewData() {
-        if (webView == null) return;
+        if (destroyed || webView == null) return;
         try {
             webView.stopLoading();
         } catch (Exception ignored) {}
@@ -586,25 +614,28 @@ public class WebActivity extends android.app.Activity {
 
     private void doPeriodicCleanup() {
         try {
-            if (webView == null) return;
+            if (destroyed || webView == null) return;
             // 页面可见时才执行完整清理,避免影响当前浏览
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
                 webView.onPause();
             }
             clearWebViewData();
             // 重新激活
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+            if (!destroyed && webView != null
+                    && Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
                 webView.onResume();
             }
             // 重新拉取当前页(保留浏览历史的位置,reload 即可)
             mainHandler.post(() -> {
-                if (webView != null && pageLoaded) {
+                if (!destroyed && webView != null && pageLoaded) {
                     webView.reload();
                 }
             });
         } catch (Exception ignored) {}
         // 下一轮
-        cleanupHandler.postDelayed(periodicCleanupRunnable, CLEANUP_INTERVAL_MS);
+        if (!destroyed) {
+            cleanupHandler.postDelayed(periodicCleanupRunnable, CLEANUP_INTERVAL_MS);
+        }
     }
 
     /**
@@ -614,7 +645,7 @@ public class WebActivity extends android.app.Activity {
     @Override
     public void onTrimMemory(int level) {
         super.onTrimMemory(level);
-        if (webView == null) return;
+        if (destroyed || webView == null) return;
         if (level >= TRIM_MEMORY_RUNNING_MODERATE) {
             // 中等压力:释放非关键缓存
             try {
@@ -650,7 +681,7 @@ public class WebActivity extends android.app.Activity {
         super.onLowMemory();
         // 旧版系统回调:一次性深度清理
         try {
-            if (webView != null) clearWebViewData();
+            if (!destroyed && webView != null) clearWebViewData();
         } catch (Exception ignored) {}
     }
 
@@ -679,6 +710,7 @@ public class WebActivity extends android.app.Activity {
         @Override
         public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
             super.onPageStarted(view, url, favicon);
+            if (destroyed) return;
             pageLoaded = false;
             startLoadTimeout();
             topProgress.setProgress(10);
@@ -687,12 +719,15 @@ public class WebActivity extends android.app.Activity {
         @Override
         public void onPageFinished(WebView view, String url) {
             super.onPageFinished(view, url);
+            if (destroyed) return;
             pageLoaded = true;
             cancelLoadTimeout();
             topProgress.setProgress(100);
             hideLoading();
             hideError();
-            mainHandler.postDelayed(() -> topProgress.setVisibility(View.GONE), 300);
+            mainHandler.postDelayed(() -> {
+                if (!destroyed) topProgress.setVisibility(View.GONE);
+            }, 300);
 
             // 记录落地页:入口地址可能只是一层 JS 跳转壳,落地页才是该库真正的首页
             if (!landingResolved && !userNavigated) {
@@ -720,6 +755,7 @@ public class WebActivity extends android.app.Activity {
             super.onReceivedError(view, request, error);
             // 仅处理主框架错误,资源错误不弹窗
             if (request.isForMainFrame()) {
+                if (destroyed) return;
                 if (retryCount < MAX_RETRY) {
                     mainHandler.postDelayed(() -> doLoadUrl(homeUrl), 1500);
                 } else {
@@ -749,14 +785,27 @@ public class WebActivity extends android.app.Activity {
                 }
             }
             runOnUiThread(() -> {
-                if (webView != null) {
-                    webView.destroy();
+                // Activity 已销毁时不能再重建 WebView,否则会操作已释放的视图树
+                if (destroyed || root == null) return;
+                WebView old = webView;
+                WebView nv;
+                try {
+                    nv = buildWebView();
+                } catch (Exception e) {
+                    // 重建失败,保持旧引用为空,避免后续调用已销毁的 WebView
+                    webView = null;
+                    showError("页面崩溃,无法重建,请返回后重试");
+                    return;
                 }
-                WebView nv = buildWebView();
+                if (old != null) {
+                    root.removeView(old);
+                    try {
+                        old.destroy();
+                    } catch (Exception ignored) {}
+                }
                 FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.MATCH_PARENT);
-                root.removeView(webView);
                 webView = nv;
                 root.addView(nv, 0, lp);
                 scrollBar.attachWebView(nv);
@@ -786,12 +835,19 @@ public class WebActivity extends android.app.Activity {
         @Override
         public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture,
                                       android.os.Message resultMsg) {
-            WebView newWebView = new WebView(WebActivity.this);
-            newWebView.setWebViewClient(new NewWindowClient());
-            WebSettings ns = newWebView.getSettings();
-            ns.setJavaScriptEnabled(true);
-            ns.setDomStorageEnabled(true);
-            ns.setSupportMultipleWindows(false);
+            // Activity 已销毁时不能再创建临时 WebView
+            if (destroyed) return false;
+            WebView newWebView;
+            try {
+                newWebView = new WebView(WebActivity.this);
+                newWebView.setWebViewClient(new NewWindowClient());
+                WebSettings ns = newWebView.getSettings();
+                ns.setJavaScriptEnabled(true);
+                ns.setDomStorageEnabled(true);
+                ns.setSupportMultipleWindows(false);
+            } catch (Exception e) {
+                return false;
+            }
             // 记录临时窗口,便于回收
             destroyPendingPopup();
             pendingPopup = newWebView;
@@ -809,6 +865,7 @@ public class WebActivity extends android.app.Activity {
     private class NewWindowClient extends WebViewClient {
         @Override
         public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+            if (destroyed) return true;
             String url = request.getUrl().toString();
             if (url == null || url.isEmpty() || "about:blank".equals(url)) return false;
             forwardUrl(url);
@@ -818,6 +875,7 @@ public class WebActivity extends android.app.Activity {
         @Override
         public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
             // window.open() 未经过 shouldOverrideUrlLoading 时的兜底
+            if (destroyed) return;
             if (url != null && !url.isEmpty() && !"about:blank".equals(url)) {
                 forwardUrl(url);
             }
@@ -826,6 +884,7 @@ public class WebActivity extends android.app.Activity {
 
     /** 把新窗口的 URL 转到主 WebView 或系统浏览器,并回收临时 WebView。 */
     private void forwardUrl(String url) {
+        if (destroyed) return;
         // 站内存在 window.open("relative/path") 这类相对地址,先补全成绝对地址
         url = absoluteUrl(url);
         if (url == null) return;
@@ -838,7 +897,12 @@ public class WebActivity extends android.app.Activity {
         // 用户主动点开的新窗口,落地页就此确定
         userNavigated = true;
         if (isSiteUrl(url)) {
-            webView.loadUrl(url);
+            // 主 WebView 可能已随 Activity 销毁,此时交给系统浏览器
+            if (webView != null) {
+                webView.loadUrl(url);
+            } else {
+                openInSystemBrowser(url);
+            }
         } else {
             openInSystemBrowser(url);
         }
@@ -850,7 +914,14 @@ public class WebActivity extends android.app.Activity {
     private String absoluteUrl(String url) {
         if (url == null || url.isEmpty()) return null;
         if (url.contains("://")) return url;
-        String base = webView != null ? webView.getUrl() : null;
+        String base = null;
+        if (!destroyed && webView != null) {
+            try {
+                base = webView.getUrl();
+            } catch (Exception ignored) {
+                // WebView 已销毁,取不到当前页
+            }
+        }
         if (base == null) base = homeUrl;
         if (base == null) return null;
         try {
@@ -865,11 +936,12 @@ public class WebActivity extends android.app.Activity {
 
     private void destroyPendingPopup() {
         if (pendingPopup == null) return;
-        try {
-            pendingPopup.stopLoading();
-            pendingPopup.destroy();
-        } catch (Exception ignored) {}
+        WebView p = pendingPopup;
         pendingPopup = null;
+        try {
+            p.stopLoading();
+            p.destroy();
+        } catch (Exception ignored) {}
     }
 
     /**
@@ -925,6 +997,7 @@ public class WebActivity extends android.app.Activity {
                     @Override
                     public void onAvailable(Network network) {
                         mainHandler.post(() -> {
+                            if (destroyed) return;
                             if (!pageLoaded && errorOverlay.getVisibility() == View.VISIBLE) {
                                 hideError();
                                 preconnectAndLoad();
@@ -934,6 +1007,7 @@ public class WebActivity extends android.app.Activity {
                     @Override
                     public void onLost(Network network) {
                         mainHandler.post(() -> {
+                            if (destroyed) return;
                             if (!pageLoaded) {
                                 showError("网络已断开");
                             }
@@ -951,6 +1025,7 @@ public class WebActivity extends android.app.Activity {
             connectivityReceiver = new BroadcastReceiver() {
                 @Override
                 public void onReceive(Context context, Intent intent) {
+                    if (destroyed) return;
                     boolean connected = isNetworkAvailable();
                     if (connected && errorOverlay.getVisibility() == View.VISIBLE) {
                         hideError();
@@ -1020,6 +1095,7 @@ public class WebActivity extends android.app.Activity {
      * 这里通过比较落地页与当前页来判断是否已回到该库首页。
      */
     private void handleBack() {
+        if (destroyed) return;
         if (webView != null && webView.canGoBack()) {
             // 已退回到该库首页(或首页的跳转壳),不再在站内回退
             if (isAtSiteHome()) {
@@ -1092,19 +1168,32 @@ public class WebActivity extends android.app.Activity {
     @Override
     protected void onPause() {
         super.onPause();
-        if (webView != null) webView.onPause();
+        if (!destroyed && webView != null) {
+            try {
+                webView.onPause();
+            } catch (Exception ignored) {}
+        }
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        if (webView != null) webView.onResume();
+        if (!destroyed && webView != null) {
+            try {
+                webView.onResume();
+            } catch (Exception ignored) {}
+        }
     }
 
     @Override
     protected void onDestroy() {
+        // 先标记已销毁,后续所有异步回调都会在这里被挡住
+        destroyed = true;
         cancelLoadTimeout();
-        cleanupHandler.removeCallbacks(periodicCleanupRunnable);
+        cleanupHandler.removeCallbacksAndMessages(null);
+        // 清空主线程队列:预连、测速、重试等回调可能还排在队列里,
+        // 它们执行时 webView 已被置空,直接访问会抛 NullPointerException
+        mainHandler.removeCallbacksAndMessages(null);
         unregisterBackCallback();
         try {
             if (networkCallback != null) {
@@ -1118,11 +1207,15 @@ public class WebActivity extends android.app.Activity {
             }
         } catch (Exception ignored) {}
         if (webView != null) {
-            webView.stopLoading();
-            webView.removeAllViews();
-            webView.destroy();
+            try {
+                webView.stopLoading();
+                webView.removeAllViews();
+                webView.destroy();
+            } catch (Exception ignored) {}
             webView = null;
         }
+        // 断开滚动条对 WebView 的引用,避免销毁后仍被访问
+        if (scrollBar != null) scrollBar.detachWebView();
         destroyPendingPopup();
         io.shutdownNow();
         super.onDestroy();
@@ -1159,6 +1252,11 @@ public class WebActivity extends android.app.Activity {
             this.webView = wv;
         }
 
+        /** WebView 被销毁后调用其方法会抛异常,这里断开引用避免误用。 */
+        void detachWebView() {
+            this.webView = null;
+        }
+
         @Override
         protected void onDraw(Canvas canvas) {
             super.onDraw(canvas);
@@ -1176,8 +1274,15 @@ public class WebActivity extends android.app.Activity {
         public boolean onTouchEvent(MotionEvent event) {
             if (webView == null) return false;
             float h = getHeight();
-            int contentHeight = (int) (webView.getContentHeight() * webView.getScale());
-            int viewHeight = webView.getHeight();
+            int contentHeight;
+            int viewHeight;
+            try {
+                // WebView 被销毁后调用其方法会抛异常,必须捕获
+                contentHeight = (int) (webView.getContentHeight() * webView.getScale());
+                viewHeight = webView.getHeight();
+            } catch (Exception e) {
+                return false;
+            }
             if (contentHeight <= viewHeight || viewHeight == 0) return false;
             int scrollable = Math.max(1, contentHeight - viewHeight);
             float ratio = viewHeight / (float) contentHeight;

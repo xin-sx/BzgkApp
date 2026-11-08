@@ -11,4 +11,5 @@
 *.apk
 !bzgk-app-release.apk
 !bzgk-app-debug.apk
+!bzgk-app-v*.apk
 /app/bzgk.keystore
