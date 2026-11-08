@@ -12,18 +12,18 @@ import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
-import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
-import android.util.AttributeSet;
+import android.window.OnBackInvokedCallback;
+import android.window.OnBackInvokedDispatcher;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
-import android.view.animation.LinearInterpolator;
 import android.webkit.CookieManager;
 import android.webkit.RenderProcessGoneDetail;
+import android.webkit.WebBackForwardList;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
@@ -35,7 +35,6 @@ import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
-import android.widget.Toast;
 
 import java.io.IOException;
 import java.net.HttpURLConnection;
@@ -43,13 +42,28 @@ import java.net.URL;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-public class MainActivity extends android.app.Activity {
+/**
+ * 二级页面:「细分」。
+ * 在 WebView 中打开某个官方库的具体页面。按系统返回键时,站内还有上一级就先在站内回退,
+ * 退到该库首页后再按则回到一级「综合」页(HomeActivity)。
+ */
+public class WebActivity extends android.app.Activity {
 
-    private static final String HOME_URL = "https://openstd.samr.gov.cn/bzgk/std/";
+    public static final String EXTRA_TITLE = "title";
+    public static final String EXTRA_URL = "url";
+    public static final String EXTRA_HOST = "host";
+
     private static final long LOAD_TIMEOUT_MS = 18000;          // 单次加载超时
     private static final int  MAX_RETRY = 2;                    // 自动重试次数
     private static final int  PRECONNECT_TIMEOUT_MS = 4000;     // 预连超时
     private static final long CLEANUP_INTERVAL_MS = 20 * 60 * 1000L; // 20分钟定期清理
+
+    private String homeUrl;      // 当前库的入口地址
+    private String siteHost;     // 当前库的域名,用于判断链接是否站内
+    private String siteTitle;    // 当前库名称,用于加载提示
+    private String landingUrl;   // 入口跳转后真正落地的页面(部分站点入口只是一层跳转壳)
+    private boolean landingResolved = false; // 落地页是否已确定
+    private boolean userNavigated = false;  // 用户是否已主动点击站内链接
 
     private WebView webView;
     private ScrollBarView scrollBar;
@@ -68,6 +82,7 @@ public class MainActivity extends android.app.Activity {
     private final ExecutorService io = Executors.newSingleThreadExecutor();
     private final Runnable timeoutRunnable = this::onLoadTimeout;
     private final Runnable periodicCleanupRunnable = this::doPeriodicCleanup;
+    private final Runnable landingDebounce = () -> landingResolved = true;
     private ConnectivityManager.NetworkCallback networkCallback;
     private boolean pageLoaded = false;
     private int retryCount = 0;
@@ -75,10 +90,21 @@ public class MainActivity extends android.app.Activity {
     private BroadcastReceiver connectivityReceiver;
     private int lastNetSpeedKbps = -1;
     private String lastNetType = "";
+    private OnBackInvokedCallback backCallback;
 
     @Override
     protected void onCreate(android.os.Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
+        Intent intent = getIntent();
+        siteTitle = intent.getStringExtra(EXTRA_TITLE);
+        homeUrl = intent.getStringExtra(EXTRA_URL);
+        siteHost = intent.getStringExtra(EXTRA_HOST);
+        if (homeUrl == null || siteHost == null) {
+            finish();
+            return;
+        }
+        if (siteTitle == null) siteTitle = siteHost;
 
         root = new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
@@ -154,6 +180,7 @@ public class MainActivity extends android.app.Activity {
 
         registerNetworkCallback();
         registerConnectivityReceiver();
+        registerBackCallback();
 
         if (isNetworkAvailable()) {
             preconnectAndLoad();
@@ -192,9 +219,12 @@ public class MainActivity extends android.app.Activity {
         s.setLoadsImagesAutomatically(true);
         // 视口与文本编码
         s.setDefaultTextEncodingName("UTF-8");
+        // 站内大量使用 target="_blank" 打开详情页,需自行接管新窗口
+        s.setSupportMultipleWindows(true);
 
         wv.setWebViewClient(new BzgkWebViewClient());
         wv.setWebChromeClient(new BzgkChromeClient());
+        wv.setDownloadListener(this::onDownloadStart);
         return wv;
     }
 
@@ -216,7 +246,7 @@ public class MainActivity extends android.app.Activity {
         box.addView(pb, pbLp);
 
         loadingText = new TextView(this);
-        loadingText.setText("正在加载国家标准全文公开系统…");
+        loadingText.setText("正在加载" + siteTitle + "…");
         loadingText.setTextColor(Color.WHITE);
         loadingText.setTextSize(14);
         loadingText.setPadding(0, dp(16), 0, 0);
@@ -278,7 +308,7 @@ public class MainActivity extends android.app.Activity {
         startLoadTimeout();
         io.execute(() -> {
             try {
-                HttpURLConnection conn = (HttpURLConnection) new URL(HOME_URL).openConnection();
+                HttpURLConnection conn = (HttpURLConnection) new URL(homeUrl).openConnection();
                 conn.setConnectTimeout(PRECONNECT_TIMEOUT_MS);
                 conn.setReadTimeout(PRECONNECT_TIMEOUT_MS);
                 conn.setRequestMethod("HEAD");
@@ -289,14 +319,14 @@ public class MainActivity extends android.app.Activity {
                 conn.disconnect();
                 mainHandler.post(() -> {
                     if (code >= 200 && code < 400) {
-                        doLoadUrl(HOME_URL);
+                        doLoadUrl(homeUrl);
                     } else {
-                        doLoadUrl(HOME_URL); // 仍尝试加载,失败时由 WebViewClient 处理
+                        doLoadUrl(homeUrl); // 仍尝试加载,失败时由 WebViewClient 处理
                     }
                 });
             } catch (IOException e) {
                 // 预连失败,直接尝试加载,由 WebView 自行处理
-                mainHandler.post(() -> doLoadUrl(HOME_URL));
+                mainHandler.post(() -> doLoadUrl(homeUrl));
             }
         });
     }
@@ -315,7 +345,7 @@ public class MainActivity extends android.app.Activity {
         if (pageLoaded) return;
         if (retryCount < MAX_RETRY) {
             // 自动重试一次
-            doLoadUrl(HOME_URL);
+            doLoadUrl(homeUrl);
         } else {
             cancelLoadTimeout();
             webView.stopLoading();
@@ -419,7 +449,7 @@ public class MainActivity extends android.app.Activity {
     }
 
     /**
-     * 异步测速:下载一个 50KB 静态资源,根据耗时估算当前带宽(KB/s)。
+     * 异步测速:下载一个小静态资源,根据耗时估算当前带宽(KB/s)。
      * 用于在网速过慢时给出"慢速"提示。
      */
     private void testNetSpeed() {
@@ -427,7 +457,7 @@ public class MainActivity extends android.app.Activity {
             long start = System.currentTimeMillis();
             int bytes = 0;
             try {
-                HttpURLConnection conn = (HttpURLConnection) new URL(HOME_URL).openConnection();
+                HttpURLConnection conn = (HttpURLConnection) new URL(homeUrl).openConnection();
                 conn.setConnectTimeout(3000);
                 conn.setReadTimeout(3000);
                 conn.setRequestMethod("HEAD");
@@ -438,7 +468,7 @@ public class MainActivity extends android.app.Activity {
                 if (code >= 200 && code < 400) {
                     // 头请求成功,真正下载小资源
                     HttpURLConnection get = (HttpURLConnection) new URL(
-                            "https://openstd.samr.gov.cn/bzgk/std/favicon.ico").openConnection();
+                            "https://" + siteHost + "/favicon.ico").openConnection();
                     get.setConnectTimeout(3000);
                     get.setReadTimeout(3000);
                     get.setUseCaches(false);
@@ -630,8 +660,12 @@ public class MainActivity extends android.app.Activity {
         @Override
         public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
             String url = request.getUrl().toString();
-            // 仅放行官方域名,其它链接走系统浏览器
-            if (url.contains("openstd.samr.gov.cn") || url.startsWith("https://openstd.samr.gov.cn/")) {
+            // 仅放行当前库的官方域名,其它链接走系统浏览器
+            if (isSiteUrl(url)) {
+                // 点击链接产生的跳转:落地页已确定,不再被后续地址覆盖
+                if (request.hasGesture()) {
+                    userNavigated = true;
+                }
                 return false;
             }
             try {
@@ -660,13 +694,21 @@ public class MainActivity extends android.app.Activity {
             hideError();
             mainHandler.postDelayed(() -> topProgress.setVisibility(View.GONE), 300);
 
+            // 记录落地页:入口地址可能只是一层 JS 跳转壳,落地页才是该库真正的首页
+            if (!landingResolved && !userNavigated) {
+                landingUrl = url;
+                // 站点可能还有后续跳转,静置一小段时间再确认落地页
+                mainHandler.removeCallbacks(landingDebounce);
+                mainHandler.postDelayed(landingDebounce, 800);
+            }
+
             // 注入 DNS 预取与渲染加速
             view.evaluateJavascript(
                 "(function(){" +
                 "  try {" +
                 "    var s=document.createElement('link');" +
                 "    s.rel='dns-prefetch';" +
-                "    s.href='//openstd.samr.gov.cn';" +
+                "    s.href='//" + siteHost + "';" +
                 "    document.head.appendChild(s);" +
                 "  } catch(e){}" +
                 "})();", null);
@@ -679,7 +721,7 @@ public class MainActivity extends android.app.Activity {
             // 仅处理主框架错误,资源错误不弹窗
             if (request.isForMainFrame()) {
                 if (retryCount < MAX_RETRY) {
-                    mainHandler.postDelayed(() -> doLoadUrl(HOME_URL), 1500);
+                    mainHandler.postDelayed(() -> doLoadUrl(homeUrl), 1500);
                 } else {
                     showError("网络异常,无法访问官网 (" + error.getErrorCode() + ")");
                 }
@@ -736,6 +778,136 @@ public class MainActivity extends android.app.Activity {
                 }
             }
         }
+
+        /**
+         * 接管 target="_blank" / window.open 打开的新窗口:
+         * 站内地址直接在本页 WebView 中打开,站外地址交给系统浏览器。
+         */
+        @Override
+        public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture,
+                                      android.os.Message resultMsg) {
+            WebView newWebView = new WebView(WebActivity.this);
+            newWebView.setWebViewClient(new NewWindowClient());
+            WebSettings ns = newWebView.getSettings();
+            ns.setJavaScriptEnabled(true);
+            ns.setDomStorageEnabled(true);
+            ns.setSupportMultipleWindows(false);
+            // 记录临时窗口,便于回收
+            destroyPendingPopup();
+            pendingPopup = newWebView;
+            lastForwardedUrl = null;
+            ((WebView.WebViewTransport) resultMsg.obj).setWebView(newWebView);
+            resultMsg.sendToTarget();
+            return true;
+        }
+    }
+
+    /**
+     * 新窗口里的链接最终都转到主 WebView 或系统浏览器。
+     * 临时 WebView 只用于拿到目标 URL,不实际渲染。
+     */
+    private class NewWindowClient extends WebViewClient {
+        @Override
+        public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+            String url = request.getUrl().toString();
+            if (url == null || url.isEmpty() || "about:blank".equals(url)) return false;
+            forwardUrl(url);
+            return true;
+        }
+
+        @Override
+        public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
+            // window.open() 未经过 shouldOverrideUrlLoading 时的兜底
+            if (url != null && !url.isEmpty() && !"about:blank".equals(url)) {
+                forwardUrl(url);
+            }
+        }
+    }
+
+    /** 把新窗口的 URL 转到主 WebView 或系统浏览器,并回收临时 WebView。 */
+    private void forwardUrl(String url) {
+        // 站内存在 window.open("relative/path") 这类相对地址,先补全成绝对地址
+        url = absoluteUrl(url);
+        if (url == null) return;
+        // 同一地址可能先后经由 shouldOverrideUrlLoading 与 onPageStarted 到达,只转发一次
+        if (url.equals(lastForwardedUrl)) {
+            mainHandler.post(this::destroyPendingPopup);
+            return;
+        }
+        lastForwardedUrl = url;
+        // 用户主动点开的新窗口,落地页就此确定
+        userNavigated = true;
+        if (isSiteUrl(url)) {
+            webView.loadUrl(url);
+        } else {
+            openInSystemBrowser(url);
+        }
+        // 临时 WebView 已无用途,在下一个消息循环再销毁,避免在回调内销毁导致崩溃
+        mainHandler.post(this::destroyPendingPopup);
+    }
+
+    /** 把相对地址补全为基于当前页面的绝对地址;无法补全时返回 null。 */
+    private String absoluteUrl(String url) {
+        if (url == null || url.isEmpty()) return null;
+        if (url.contains("://")) return url;
+        String base = webView != null ? webView.getUrl() : null;
+        if (base == null) base = homeUrl;
+        if (base == null) return null;
+        try {
+            return new java.net.URL(new java.net.URL(base), url).toString();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private WebView pendingPopup;
+    private String lastForwardedUrl;
+
+    private void destroyPendingPopup() {
+        if (pendingPopup == null) return;
+        try {
+            pendingPopup.stopLoading();
+            pendingPopup.destroy();
+        } catch (Exception ignored) {}
+        pendingPopup = null;
+    }
+
+    /**
+     * 法规库提供"文字版 / 图片版"下载,服务端以附件形式返回 docx / pdf,
+     * WebView 无法直接渲染,这里交给系统浏览器或下载器处理。
+     */
+    private void onDownloadStart(String url, String userAgent, String contentDisposition,
+                                 String mimetype, long contentLength) {
+        try {
+            Intent i = new Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url));
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(i);
+        } catch (Exception ignored) {
+            // 没有可处理的应用时退回到系统浏览器
+            openInSystemBrowser(url);
+        }
+    }
+
+    private void openInSystemBrowser(String url) {
+        try {
+            Intent i = new Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url));
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(i);
+        } catch (Exception ignored) {}
+    }
+
+    /** 判断 URL 是否属于当前库(同域名),用于决定站内打开还是跳系统浏览器。 */
+    private boolean isSiteUrl(String url) {
+        if (url == null) return false;
+        String lower = url.toLowerCase();
+        int schemeEnd = lower.indexOf("://");
+        if (schemeEnd < 0) return false;
+        String hostPart = lower.substring(schemeEnd + 3);
+        int slash = hostPart.indexOf('/');
+        if (slash >= 0) hostPart = hostPart.substring(0, slash);
+        int colon = hostPart.indexOf(':');
+        if (colon >= 0) hostPart = hostPart.substring(0, colon);
+        return hostPart.equals(siteHost) || hostPart.endsWith("." + siteHost);
     }
 
     // ============== 网络监听 ==============
@@ -814,13 +986,107 @@ public class MainActivity extends android.app.Activity {
 
     // ============== 生命周期 ==============
 
-    @Override
-    public void onBackPressed() {
+    /**
+     * Android 13+ 的返回键走 OnBackInvokedCallback,
+     * 与旧系统的 onBackPressed 保持同一套逻辑。
+     */
+    private void registerBackCallback() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return;
+        try {
+            OnBackInvokedDispatcher dispatcher = getOnBackInvokedDispatcher();
+            if (dispatcher == null) return;
+            backCallback = () -> mainHandler.post(this::handleBack);
+            dispatcher.registerOnBackInvokedCallback(
+                    OnBackInvokedDispatcher.PRIORITY_DEFAULT, backCallback);
+        } catch (Exception ignored) {}
+    }
+
+    private void unregisterBackCallback() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return;
+        try {
+            OnBackInvokedDispatcher dispatcher = getOnBackInvokedDispatcher();
+            if (dispatcher != null && backCallback != null) {
+                dispatcher.unregisterOnBackInvokedCallback(backCallback);
+            }
+        } catch (Exception ignored) {}
+    }
+
+    /**
+     * 系统返回键:站内还有上一级时先在站内回退;退到该库首页后再按则结束本页,
+     * 回到一级「综合」页。
+     *
+     * 部分站点(如国家行政法规库)的入口地址只是一层 JS 跳转壳,
+     * 直接按返回键会退到这层壳并被再次跳回,造成"按了没反应"。
+     * 这里通过比较落地页与当前页来判断是否已回到该库首页。
+     */
+    private void handleBack() {
         if (webView != null && webView.canGoBack()) {
+            // 已退回到该库首页(或首页的跳转壳),不再在站内回退
+            if (isAtSiteHome()) {
+                webView.clearHistory();
+                finish();
+                return;
+            }
             webView.goBack();
         } else {
-            super.onBackPressed();
+            finish();
         }
+    }
+
+    /**
+     * 旧系统(API 32 及以下)通过 onBackPressed 接收返回键。
+     */
+    @SuppressWarnings("deprecation")
+    @Override
+    public void onBackPressed() {
+        handleBack();
+    }
+
+    /**
+     * 判断当前是否已经站在该库的首页上。
+     * 依据两条:当前页就是该库的落地页(首页),或浏览历史里只剩一条(已在最底端)。
+     */
+    private boolean isAtSiteHome() {
+        if (webView == null) return false;
+        String current = webView.getUrl();
+        if (current == null) return false;
+
+        // 当前页就是落地页(首页)
+        if (landingUrl != null && samePage(current, landingUrl)) return true;
+
+        // 浏览历史里只剩一条,说明已在最底端
+        WebBackForwardList list = webView.copyBackForwardList();
+        return list != null && list.getSize() <= 1;
+    }
+
+    /** 比较两个 URL 是否指向同一个页面(忽略末尾斜杠与锚点)。 */
+    private static boolean samePage(String a, String b) {
+        if (a == null || b == null) return false;
+        String x = stripUrl(a);
+        String y = stripUrl(b);
+        if (x.equals(y)) return true;
+        // 仅当一方带查询参数、另一方不带时,才退化为只比路径;
+        // 两边都带参数说明是同一个入口的不同筛选条件,不能视为同一页
+        boolean xHasQuery = x.indexOf('?') >= 0;
+        boolean yHasQuery = y.indexOf('?') >= 0;
+        if (xHasQuery == yHasQuery) return false;
+        return pathOf(x).equals(pathOf(y));
+    }
+
+    /** 取 URL 的路径部分(不含查询参数与锚点)。 */
+    private static String pathOf(String url) {
+        String u = url;
+        int q = u.indexOf('?');
+        if (q >= 0) u = u.substring(0, q);
+        return u;
+    }
+
+    private static String stripUrl(String url) {
+        String u = url.trim();
+        int hash = u.indexOf('#');
+        if (hash >= 0) u = u.substring(0, hash);
+        if (u.length() > 1 && u.endsWith("/")) u = u.substring(0, u.length() - 1);
+        return u;
     }
 
     @Override
@@ -839,6 +1105,7 @@ public class MainActivity extends android.app.Activity {
     protected void onDestroy() {
         cancelLoadTimeout();
         cleanupHandler.removeCallbacks(periodicCleanupRunnable);
+        unregisterBackCallback();
         try {
             if (networkCallback != null) {
                 ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
@@ -856,6 +1123,7 @@ public class MainActivity extends android.app.Activity {
             webView.destroy();
             webView = null;
         }
+        destroyPendingPopup();
         io.shutdownNow();
         super.onDestroy();
     }
