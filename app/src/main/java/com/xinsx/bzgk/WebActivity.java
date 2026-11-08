@@ -87,6 +87,16 @@ public class WebActivity extends android.app.Activity {
     private ConnectivityManager.NetworkCallback networkCallback;
     private boolean pageLoaded = false;
     private int retryCount = 0;
+
+    /**
+     * 空白页重试。
+     * 部分站点(如国家标准全文公开系统)在 WAF 触发风控时,会返回
+     * HTTP 200 但 Content-Length: 0 的空响应——不报错、不触发 onReceivedError,
+     * WebView 表现为一片纯白。重试同一个 URL 通常就能拿到内容。
+     */
+    private int blankRetryCount = 0;
+    private static final int MAX_BLANK_RETRY = 3;
+    private static final long BLANK_RETRY_DELAY_MS = 1200;
     private boolean receiverRegistered = false;
     private BroadcastReceiver connectivityReceiver;
     private int lastNetSpeedKbps = -1;
@@ -747,6 +757,67 @@ public class WebActivity extends android.app.Activity {
                 "    document.head.appendChild(s);" +
                 "  } catch(e){}" +
                 "})();", null);
+
+            // 检测空白页:某些站点风控会返回 200 + 空 body,页面一片纯白
+            detectBlankPage(view, url);
+        }
+
+        /**
+         * 判断当前页面是否"有内容"。标准全文公开系统等站点在触发风控时
+         * 会返回 HTTP 200 + Content-Length: 0,既不报错也不触发 onReceivedError,
+         * WebView 只显示一片空白。这里在页面加载完成后探测 DOM,
+         * 若为空则自动重试同一个 URL。
+         */
+        private void detectBlankPage(WebView view, String url) {
+            if (destroyed || webView != view) return;
+            if (url == null || url.isEmpty() || url.startsWith("about:")) return;
+            // 只对站内页面白屏做重试,避免误伤正常的空白文档
+            if (!isSiteUrl(url)) return;
+
+            view.evaluateJavascript(
+                "(function(){try{" +
+                "  var b=document.body;" +
+                "  if(!b) return 0;" +
+                "  var t=(b.innerText||'').replace(/\\s/g,'');" +
+                "  var h=b.innerHTML||'';" +
+                "  if(t.length>0) return 0;" +
+                "  if(h.length>200 && h.indexOf('<script')<0) return 0;" +
+                "  return 1;" +
+                "}catch(e){return 0;}})();",
+                value -> {
+                    if (destroyed || webView == null) return;
+                    // "1" 表示页面确实是空的
+                    if (value == null || !"1".equals(value.trim())) {
+                        blankRetryCount = 0;
+                        return;
+                    }
+                    if (blankRetryCount >= MAX_BLANK_RETRY) {
+                        showError("页面加载为空,请稍后重试");
+                        return;
+                    }
+                    blankRetryCount++;
+                    showLoading();
+                    mainHandler.postDelayed(() -> {
+                        if (destroyed || webView == null) return;
+                        // 清掉 WebView 里缓存的那份空响应,再重新加载
+                        try {
+                            webView.clearCache(true);
+                        } catch (Exception ignored) {}
+                        // 用 loadUrl 而非 reload:reload 会复用当前这条历史记录,
+                        // 而空响应可能已被缓存;loadUrl 重新发起请求更可靠
+                        webView.loadUrl(appendCacheBuster(url));
+                    }, BLANK_RETRY_DELAY_MS);
+                });
+        }
+
+        /**
+         * 给 URL 追加一个时间戳参数,强制 WebView 绕过本地缓存重新发起网络请求。
+         * 只在已带查询串的地址上追加,避免影响站点对 URL 的解析。
+         */
+        private String appendCacheBuster(String url) {
+            if (url == null) return "";
+            String sep = url.indexOf('?') >= 0 ? "&" : "?";
+            return url + sep + "_ts=" + System.currentTimeMillis();
         }
 
         @Override
@@ -1141,12 +1212,25 @@ public class WebActivity extends android.app.Activity {
         String x = stripUrl(a);
         String y = stripUrl(b);
         if (x.equals(y)) return true;
+        // 空白页重试会追加 _ts 参数,比较前先去掉,避免把同一页判成不同页
+        x = dropCacheBuster(x);
+        y = dropCacheBuster(y);
+        if (x.equals(y)) return true;
         // 仅当一方带查询参数、另一方不带时,才退化为只比路径;
         // 两边都带参数说明是同一个入口的不同筛选条件,不能视为同一页
         boolean xHasQuery = x.indexOf('?') >= 0;
         boolean yHasQuery = y.indexOf('?') >= 0;
         if (xHasQuery == yHasQuery) return false;
         return pathOf(x).equals(pathOf(y));
+    }
+
+    /** 去掉 URL 里用于绕过缓存的 _ts 参数。 */
+    private static String dropCacheBuster(String url) {
+        if (url == null || url.indexOf("_ts=") < 0) return url;
+        String u = url.replaceAll("([?&])_ts=[0-9]+&?", "$1");
+        if (u.endsWith("&")) u = u.substring(0, u.length() - 1);
+        if (u.endsWith("?")) u = u.substring(0, u.length() - 1);
+        return u;
     }
 
     /** 取 URL 的路径部分(不含查询参数与锚点)。 */
